@@ -27,6 +27,7 @@ error AIP__NoActiveIntent();
 error AIP__CommitmentMismatch();
 error AIP__AllowanceResetFailed(address token, address spender);
 error AIP__BlacklistedAddress(address target);  // 新增
+error AIP__SlippageExceeded(address token, uint256 amountOut, uint256 minAmountOut);
 
 event IntentOpened(uint256 indexed intentId, address indexed account);
 event IntentClosed(uint256 indexed intentId, address indexed account);
@@ -36,6 +37,7 @@ event RegistryUpdated(address indexed newRegistry);  // 新增
 
 uint256 constant INTENT_TSLOT    = 0xA1B2C3D4E5F600000000000000000000000000000000000000000000000001;
 uint256 constant COMMIT_TSLOT    = 0xA1B2C3D4E5F600000000000000000000000000000000000000000000000002;
+uint256 constant SLIPPAGE_TSLOT  = 0xA1B2C3D4E5F600000000000000000000000000000000000000000000000003;
 uint32  constant TWAP_SECONDS    = 300;
 uint256 constant MAX_DEV_BPS     = 100;
 int24   constant MIN_TICK        = -92200;
@@ -67,11 +69,15 @@ contract AIPSensoryLayer is IERC7579Hook {
     function preCheck(address, uint256, bytes calldata msgData)
         external override onlyAccount returns (bytes memory hookData)
     {
-        (address[] memory pools, address[] memory tokens, address[] memory spenders)
-            = _decodeContext(msgData);
+        (
+            address[] memory pools,
+            address[] memory tokens,
+            address[] memory spenders,
+            uint256[] memory minAmountsOut
+        ) = _decodeContext(msgData);
 
         // 1. Registry 黑名單檢查（GoPlus 同步）
-        _registryCheck(pools, tokens);
+        _registryCheck(pools, tokens, spenders);
 
         // 2. Liquidity Fingerprint
         for (uint256 i; i < pools.length;) {
@@ -79,11 +85,13 @@ contract AIPSensoryLayer is IERC7579Hook {
             unchecked { ++i; }
         }
 
-        // 3. 開啟 Intent
+        // 3. Slippage Sentry：記錄交易前各 token 餘額
+        uint256[] memory balancesBefore = _recordBalances(tokens);
+        // 4. 開啟 Intent
         uint256 intentId = _openIntent();
 
         // 4. 打包 hookData
-        hookData = abi.encode(intentId, ACCOUNT, tokens, spenders);
+        hookData = abi.encode(intentId, ACCOUNT, tokens, spenders, minAmountsOut, balancesBefore);
 
         // 5. Hash Commitment
         _tstore(COMMIT_TSLOT, uint256(keccak256(hookData)));
@@ -95,12 +103,16 @@ contract AIPSensoryLayer is IERC7579Hook {
         bytes32 stored   = bytes32(_tload(COMMIT_TSLOT));
         bytes32 computed = keccak256(hookData);
         if (stored != computed) revert AIP__CommitmentMismatch();
-
-        (uint256 intentId, address account, address[] memory tokens, address[] memory spenders)
-            = abi.decode(hookData, (uint256, address, address[], address[]));
-
+        (
+            uint256 intentId,
+            address account,
+            address[] memory tokens,
+            address[] memory spenders,
+            uint256[] memory minAmountsOut,
+            uint256[] memory balancesBefore
+        ) = abi.decode(hookData, (uint256, address, address[], address[], uint256[], uint256[]));
         if (_tload(INTENT_TSLOT) != intentId) revert AIP__NoActiveIntent();
-
+        _checkSlippage(tokens, minAmountsOut, balancesBefore);
         _enforceZeroAllowance(account, tokens, spenders);
         _closeIntent(intentId, account);
     }
@@ -109,7 +121,8 @@ contract AIPSensoryLayer is IERC7579Hook {
 
     function _registryCheck(
         address[] memory pools,
-        address[] memory tokens
+        address[] memory tokens,
+        address[] memory spenders
     ) internal view {
         if (address(registry) == address(0)) return;
 
@@ -123,6 +136,12 @@ contract AIPSensoryLayer is IERC7579Hook {
         for (uint256 i; i < tokens.length;) {
             if (tokens[i] != address(0) && registry.isBlacklisted(tokens[i])) {
                 revert AIP__BlacklistedAddress(tokens[i]);
+            }
+            unchecked { ++i; }
+        }
+        for (uint256 i; i < spenders.length;) {
+            if (spenders[i] != address(0) && registry.isBlacklisted(spenders[i])) {
+                revert AIP__BlacklistedAddress(spenders[i]);
             }
             unchecked { ++i; }
         }
@@ -190,6 +209,51 @@ contract AIPSensoryLayer is IERC7579Hook {
 
     // ── Intent Lifecycle ──────────────────────────────────
 
+
+    // ── Slippage Sentry ───────────────────────────────
+    function _recordBalances(address[] memory tokens)
+        internal view returns (uint256[] memory balances)
+    {
+        balances = new uint256[](tokens.length);
+        for (uint256 i; i < tokens.length;) {
+            if (tokens[i] != address(0)) {
+                (bool ok, bytes memory data) = tokens[i].staticcall(
+                    abi.encodeWithSignature("balanceOf(address)", ACCOUNT)
+                );
+                if (ok && data.length == 32) {
+                    balances[i] = abi.decode(data, (uint256));
+                }
+            }
+            unchecked { ++i; }
+        }
+    }
+
+    function _checkSlippage(
+        address[] memory tokens,
+        uint256[] memory minAmountsOut,
+        uint256[] memory balancesBefore
+    ) internal view {
+        if (minAmountsOut.length == 0) return;
+        uint256 len = tokens.length < minAmountsOut.length ? tokens.length : minAmountsOut.length;
+        for (uint256 i; i < len;) {
+            if (tokens[i] != address(0) && minAmountsOut[i] > 0) {
+                (bool ok, bytes memory data) = tokens[i].staticcall(
+                    abi.encodeWithSignature("balanceOf(address)", ACCOUNT)
+                );
+                if (ok && data.length == 32) {
+                    uint256 balanceAfter = abi.decode(data, (uint256));
+                    uint256 amountOut = balanceAfter > balancesBefore[i]
+                        ? balanceAfter - balancesBefore[i]
+                        : 0;
+                    if (amountOut < minAmountsOut[i]) {
+                        revert AIP__SlippageExceeded(tokens[i], amountOut, minAmountsOut[i]);
+                    }
+                }
+            }
+            unchecked { ++i; }
+        }
+    }
+
     function _openIntent() internal returns (uint256 intentId) {
         unchecked { intentId = ++_intentCounter; }
         _tstore(INTENT_TSLOT, intentId);
@@ -205,16 +269,22 @@ contract AIPSensoryLayer is IERC7579Hook {
 
     function _decodeContext(bytes calldata msgData)
         internal pure
-        returns (address[] memory pools, address[] memory tokens, address[] memory spenders)
+        returns (
+            address[] memory pools,
+            address[] memory tokens,
+            address[] memory spenders,
+            uint256[] memory minAmountsOut
+        )
     {
         if (msgData.length < 4) {
-            return (new address[](0), new address[](0), new address[](0));
+            return (new address[](0), new address[](0), new address[](0), new uint256[](0));
         }
         bytes calldata params = msgData[4:];
         if (params.length < 96) {
-            return (new address[](0), new address[](0), new address[](0));
+            return (new address[](0), new address[](0), new address[](0), new uint256[](0));
         }
-        (pools, tokens, spenders) = abi.decode(params, (address[], address[], address[]));
+        (pools, tokens, spenders, minAmountsOut) =
+            abi.decode(params, (address[], address[], address[], uint256[]));
     }
 
     // ── EIP-1153 ──────────────────────────────────────────

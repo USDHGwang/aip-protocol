@@ -28,7 +28,8 @@ contract AIPStressTest is Test {
         address[] memory spenders
     ) internal pure returns (bytes memory) {
         bytes4 sel = bytes4(keccak256("execute(address[],address[],address[])"));
-        return abi.encodePacked(sel, abi.encode(pools, tokens, spenders));
+        uint256[] memory minAmountsOut = new uint256[](0);
+        return abi.encodePacked(sel, abi.encode(pools, tokens, spenders, minAmountsOut));
     }
 
     // ── 壓力測試 1：100 筆正常交易 ──────────────────────

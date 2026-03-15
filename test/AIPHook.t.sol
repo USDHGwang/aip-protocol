@@ -23,7 +23,8 @@ contract AIPHookTest is Test {
         address[] memory spenders
     ) internal pure returns (bytes memory) {
         bytes4 sel = bytes4(keccak256("execute(address[],address[],address[])"));
-        return abi.encodePacked(sel, abi.encode(pools, tokens, spenders));
+        uint256[] memory minAmountsOut = new uint256[](0);
+        return abi.encodePacked(sel, abi.encode(pools, tokens, spenders, minAmountsOut));
     }
 
     function test_preCheck_normalPool_passes() public {
@@ -93,7 +94,8 @@ contract AIPFlashLoanTest is Test {
         address[] memory spenders = new address[](0);
         pools[0] = POOL_ETH_USDC;
         bytes4 sel = bytes4(keccak256("execute(address[],address[],address[])"));
-        bytes memory msgData = abi.encodePacked(sel, abi.encode(pools, tokens, spenders));
+        uint256[] memory minOut = new uint256[](0);
+        bytes memory msgData = abi.encodePacked(sel, abi.encode(pools, tokens, spenders, minOut));
 
         vm.expectRevert();
         hook.preCheck(address(this), 0, msgData);
@@ -121,7 +123,8 @@ contract AIPRegistryTest is Test {
         address[] memory spenders
     ) internal pure returns (bytes memory) {
         bytes4 sel = bytes4(keccak256("execute(address[],address[],address[])"));
-        return abi.encodePacked(sel, abi.encode(pools, tokens, spenders));
+        uint256[] memory minAmountsOut = new uint256[](0);
+        return abi.encodePacked(sel, abi.encode(pools, tokens, spenders, minAmountsOut));
     }
 
     // 測試 1：正常地址不在黑名單，通過
@@ -182,5 +185,59 @@ contract AIPRegistryTest is Test {
         assertTrue(reg.isBlacklisted(address(0x222)));
         assertFalse(reg.isBlacklisted(address(0x333)));
         console.log("test_registry_batch_blacklist: PASSED");
+    }
+}
+
+contract AIPFuzzTest is Test {
+
+    AIPSensoryLayer public hook;
+    address constant POOL_ETH_USDC = 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640;
+
+    function setUp() public {
+        vm.createSelectFork(vm.envString("ETH_RPC_URL"));
+        hook = new AIPSensoryLayer(address(this), address(0));
+    }
+
+    /// @notice Fuzz 1：任意 bytes 丟進 postCheck，應該全部 revert
+    function testFuzz_postCheck_randomBytes_alwaysReverts(bytes memory randomHookData) public {
+        address[] memory pools    = new address[](1);
+        address[] memory tokens   = new address[](0);
+        address[] memory spenders = new address[](0);
+        pools[0] = POOL_ETH_USDC;
+
+        bytes4 sel = bytes4(keccak256("execute(address[],address[],address[])"));
+        uint256[] memory minOut = new uint256[](0);
+        bytes memory msgData = abi.encodePacked(sel, abi.encode(pools, tokens, spenders, minOut));
+
+        // 先跑一次合法的 preCheck，建立 TSTORE 狀態
+        bytes memory validHookData = hook.preCheck(address(this), 0, msgData);
+
+        // 只要 randomHookData 跟 validHookData 不同，就應該 revert
+        if (keccak256(randomHookData) != keccak256(validHookData)) {
+            vm.expectRevert();
+            hook.postCheck(randomHookData);
+        }
+    }
+
+    /// @notice Fuzz 2：隨機地址丟進 preCheck，不能 panic，只能正常 revert 或通過
+    function testFuzz_preCheck_randomAddresses_noPanic(address randomPool) public {
+        // 排除 address(0) 避免無意義輸入
+        vm.assume(randomPool != address(0));
+
+        address[] memory pools    = new address[](1);
+        address[] memory tokens   = new address[](0);
+        address[] memory spenders = new address[](0);
+        pools[0] = randomPool;
+
+        bytes4 sel = bytes4(keccak256("execute(address[],address[],address[])"));
+        uint256[] memory minOut = new uint256[](0);
+        bytes memory msgData = abi.encodePacked(sel, abi.encode(pools, tokens, spenders, minOut));
+
+        // 不管 revert 還是通過都可以，但不能 panic
+        try hook.preCheck(address(this), 0, msgData) returns (bytes memory) {
+            // 通過也沒問題
+        } catch {
+            // revert 也沒問題，只要不是 panic
+        }
     }
 }

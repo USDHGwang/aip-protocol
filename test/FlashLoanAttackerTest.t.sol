@@ -18,10 +18,18 @@ contract FlashLoanAttackerTest is Test {
     function setUp() public {
         vm.createSelectFork(vm.envString("ETH_RPC_URL"));
 
-        hook     = new AIPSensoryLayer(address(this), address(0));
+        // 預測 attacker 地址（下一個 nonce + 1，因為先部署 hook）
+        address predictedAttacker = vm.computeCreateAddress(
+            address(this),
+            vm.getNonce(address(this)) + 1
+        );
+
+        // 用預測地址部署 hook，ACCOUNT = 即將部署的 attacker
+        hook     = new AIPSensoryLayer(predictedAttacker, address(0));
+        // 部署 attacker，地址會等於 predictedAttacker
         attacker = new FlashLoanAttacker(address(hook));
-        hook     = new AIPSensoryLayer(address(attacker), address(0));
-        attacker = new FlashLoanAttacker(address(hook));
+
+        require(address(attacker) == predictedAttacker, "Address prediction failed");
 
         vm.prank(USDC_WHALE);
         IERC20(USDC).transfer(address(attacker), 2_000e6);
@@ -54,7 +62,8 @@ contract FlashLoanAttackerTest is Test {
         pools[0] = POOL_ETH_USDC;
 
         bytes4 sel = bytes4(keccak256("execute(address[],address[],address[])"));
-        bytes memory msgData = abi.encodePacked(sel, abi.encode(pools, tokens, spenders));
+        uint256[] memory minOut = new uint256[](0);
+        bytes memory msgData = abi.encodePacked(sel, abi.encode(pools, tokens, spenders, minOut));
 
         bytes memory hookData = testHook.preCheck(address(this), 0, msgData);
         assertTrue(hookData.length > 0, "Normal trade should pass");
